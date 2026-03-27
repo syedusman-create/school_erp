@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: school-erp-planner
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: API_SECRET
+        sync: false
+      - key: ACADEMIC_YEAR
+        value: "2025-26"
