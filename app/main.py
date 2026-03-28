@@ -294,24 +294,36 @@ def clean_json(raw: str) -> str:
 # ── LLM PLAN ─────────────────────────────────────────────────
 
 def build_prompt(query: str, history: list) -> list:
+    # FIX: system prompt sent as proper "system" role, not prepended to user message.
+    # This gives the model clearer instruction boundaries and better rule-following.
     system = f"""You are a query planner for a school ERP (Frappe).
 Convert the user's question into a JSON query plan.
 Current academic year: {CUR_YEAR}
 
 DOCTYPES AND FIELDS:
-- Student: name, student_name, student_email_id, student_mobile_number, date_of_birth, gender, joining_date, enabled, custom_admission_no, custom_father_name, custom_mother_name, city, blood_group
-- Instructor: name, instructor_name, custom_teacher_email, status
+- Student: name, student_name, first_name, last_name, student_email_id, student_mobile_number, date_of_birth, gender, blood_group, city, state, address_line_1, pincode, joining_date, enabled, custom_father_name, custom_mother_name, custom_guardian_contact_number, custom_guardian_email_id, custom_guardian_occupation, custom_admission_no, custom_student_category, custom_sats_id
+- Instructor: name, instructor_name, custom_teacher_email, department, status
 - Employee: name, employee_name, department, designation, status
-- Program Enrollment: student, student_name, program, academic_year, student_batch_name
+- Guardian: name, guardian_name, mobile_number, email_address, occupation
+- Program Enrollment: name, student, student_name, program, academic_year, student_batch_name, enrollment_date
 - Student Group: name, student_group_name, program, academic_year
-- Student Group Instructor: parent, instructor, instructor_name
-- Student Attendance: student, student_name, student_group, date, status
-- Attendance: employee_name, department, attendance_date, status
-- Fees: student, student_name, outstanding_amount, due_date, program, academic_year
-- Fee Structure: name, program, academic_year, total_amount
-- Fee Component: parent, fees_category, amount
-- School Timetable: name, title, class, academic_year
-- Timetable Period: parent, period_no, weekday, subject, teacher, from_time, to_time
+- Student Group Instructor: name, parent, instructor, instructor_name
+- Student Attendance: name, student, student_name, student_group, date, status, leave_type
+- Attendance: name, employee, employee_name, department, attendance_date, status, leave_type
+- Fees: name, student, student_name, program, academic_year, due_date, outstanding_amount, grand_total, status
+- Fee Structure: name, program, academic_year, academic_term, total_amount
+- Fee Component: name, parent, fees_category, amount, description
+- Fee Schedule: name, fee_schedule_name, program, academic_year, based_on, fee_schedule_date
+- Course Enrollment: name, student, student_name, course, program, enrollment_date, program_enrollment
+- School Timetable: name, title, class, academic_year, school_level
+- Timetable Period: name, parent, period_no, weekday, subject, teacher, from_time, to_time
+
+IMPORTANT FIELD NOTES:
+- Student.custom_father_name and custom_mother_name hold parent names
+- Student.custom_guardian_contact_number holds guardian phone
+- Student.custom_admission_no holds the school admission number
+- Student Attendance.student_group is the full group name string e.g. "6th Standard Section - {CUR_YEAR}" — do NOT filter with just the program name like "6th Standard"
+- Student Attendance has no .program field — always join via Student Group or use student_name LIKE filter for per-student queries
 
 HARD RULES:
 1. Never use subqueries or nested filters. Always use pipe between steps.
@@ -329,6 +341,8 @@ HARD RULES:
 13. No OR filters. No $or. Filter one field at a time.
 14. For post_process operations use: set_subtract, group_count, cross_filter, missing_field
 15. Always try to answer. Only set fallback=true if completely unrelated to school data.
+16. op filter supports: ">", ">=", "<", "<=", "=" — e.g. {{"outstanding_amount": {{"op": ">=", "val": 500}}}}
+17. For attendance history of a specific student: filter Student Attendance with student_name LIKE, add date range filters for the period (date >= start, date <= end)
 
 PLAN FORMAT:
 {{
@@ -370,7 +384,7 @@ Q: students in 6th standard with pending fees
 {{"intent":"class pending fees","steps":[{{"id":"s1","doctype":"Program Enrollment","filters":{{"program":"6th Standard"}},"fields":["student","student_name","program"],"limit":200,"order_by":"","save_as":"enrolled","pipe_from":"","pipe_field":"","pipe_into":""}},{{"id":"s2","doctype":"Fees","filters":{{"outstanding_amount":{{"op":">","val":0}}}},"fields":["student","student_name","outstanding_amount","due_date"],"limit":200,"order_by":"outstanding_amount desc","save_as":"","pipe_from":"enrolled","pipe_field":"student","pipe_into":"student"}}],"post_process":[],"fallback":false,"fallback_msg":""}}
 
 Q: who is navaneeth
-{{"intent":"student profile","steps":[{{"id":"s1","doctype":"Student","filters":{{"student_name":"~Navaneeth"}},"fields":["student_name","student_email_id","student_mobile_number","date_of_birth","gender","joining_date","custom_admission_no"],"limit":3,"order_by":"","save_as":"","pipe_from":"","pipe_field":"","pipe_into":""}}],"post_process":[],"fallback":false,"fallback_msg":""}}
+{{"intent":"student profile","steps":[{{"id":"s1","doctype":"Student","filters":{{"student_name":"~Navaneeth"}},"fields":["student_name","student_email_id","student_mobile_number","date_of_birth","gender","joining_date","custom_admission_no","custom_father_name","custom_mother_name","city","blood_group"],"limit":3,"order_by":"","save_as":"","pipe_from":"","pipe_field":"","pipe_into":""}}],"post_process":[],"fallback":false,"fallback_msg":""}}
 
 Q: who is the class teacher of grade 3
 {{"intent":"class teacher lookup","steps":[{{"id":"s1","doctype":"Student Group","filters":{{"program":"3rd Standard"}},"fields":["name","student_group_name","program"],"limit":1,"order_by":"","save_as":"grp","pipe_from":"","pipe_field":"","pipe_into":""}},{{"id":"s2","doctype":"Student Group Instructor","filters":{{}},"fields":["instructor","instructor_name","parent"],"limit":5,"order_by":"","save_as":"","pipe_from":"grp","pipe_field":"name","pipe_into":"parent"}}],"post_process":[],"fallback":false,"fallback_msg":""}}
@@ -384,18 +398,28 @@ Q: which class has the most absences
 Q: students without email
 {{"intent":"students missing contact","steps":[{{"id":"s1","doctype":"Student","filters":{{"enabled":1}},"fields":["name","student_name","student_email_id","student_mobile_number"],"limit":500,"order_by":"","save_as":"students","pipe_from":"","pipe_field":"","pipe_into":""}}],"post_process":[{{"type":"missing_field","from":"students","field":"student_email_id","save_as":"result"}}],"fallback":false,"fallback_msg":""}}
 
+Q: students without phone number
+{{"intent":"students missing mobile","steps":[{{"id":"s1","doctype":"Student","filters":{{"enabled":1}},"fields":["name","student_name","student_email_id","student_mobile_number"],"limit":500,"order_by":"","save_as":"students","pipe_from":"","pipe_field":"","pipe_into":""}}],"post_process":[{{"type":"missing_field","from":"students","field":"student_mobile_number","save_as":"result"}}],"fallback":false,"fallback_msg":""}}
+
+Q: how many times was Navaneeth absent this month
+{{"intent":"student attendance history","steps":[{{"id":"s1","doctype":"Student Attendance","filters":{{"student_name":"~Navaneeth","status":"Absent","date":{{"op":">=","val":"MONTH_START"}}}},"fields":["student_name","student_group","date","status"],"limit":100,"order_by":"date desc","save_as":"","pipe_from":"","pipe_field":"","pipe_into":""}}],"post_process":[],"fallback":false,"fallback_msg":""}}
+
+Q: what is navaneeth's father's name
+{{"intent":"student parent info","steps":[{{"id":"s1","doctype":"Student","filters":{{"student_name":"~Navaneeth"}},"fields":["student_name","custom_father_name","custom_mother_name","custom_guardian_contact_number"],"limit":3,"order_by":"","save_as":"","pipe_from":"","pipe_field":"","pipe_into":""}}],"post_process":[],"fallback":false,"fallback_msg":""}}
+
 Return ONLY raw JSON. No markdown, no explanation.
 
 Q: """
 
-    messages = []
+    # Build messages array with proper system role separation
+    messages = [{"role": "system", "content": system}]
 
     # Add conversation history (last 6 exchanges)
     for h in history[-6:]:
         messages.append(h)
 
-    # Add current query
-    messages.append({"role": "user", "content": system + query})
+    # Add current query as user message only (not mixed with system prompt)
+    messages.append({"role": "user", "content": query})
 
     return messages
 
