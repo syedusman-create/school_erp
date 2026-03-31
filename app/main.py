@@ -38,6 +38,7 @@ class PlanResponse(BaseModel):
     pattern: Optional[str] = None
     plan: Optional[dict] = None
     message: Optional[str] = None
+    ctx: Optional[dict] = None   # resolved pre-processor context for history inheritance
 
 
 # ── HEALTH CHECK ──────────────────────────────────────────────
@@ -363,12 +364,23 @@ def get_timetable_name(program: str) -> Optional[str]:
     return TIMETABLE_NAMES.get(program)
 
 
-def extract_query_context(query: str) -> dict:
+def extract_query_context(query: str, history: list = None) -> dict:
     """
-    Master pre-processor. Runs all extractors against the raw query
-    and returns a structured context dict.
-    This is injected into the LLM prompt so the model works with
-    resolved values rather than raw user text.
+    Master pre-processor. Extracts structured facts from the current query,
+    then inherits any unresolved fields from the previous turn's context
+    (stored as _ctx in history assistant messages).
+
+    Follow-up resolution examples:
+      Turn 1: "timetable for 5th standard on monday"
+              → resolves program=5th Standard, weekday=Monday
+      Turn 2: "what about tuesday?"
+              → resolves weekday=Tuesday only,
+                inherits program=5th Standard from turn 1
+
+      Turn 1: "who teaches maths in 8th on monday"
+              → resolves subject=Maths, program=8th Standard, weekday=Monday
+      Turn 2: "and on tuesday?"
+              → inherits program + subject, resolves new weekday=Tuesday
     """
     program     = extract_program(query)
     weekday     = extract_weekday(query)
@@ -380,24 +392,59 @@ def extract_query_context(query: str) -> dict:
     date_period = extract_date_period(query)
     instructor  = extract_instructor_name(query)
 
-    # Resolve timetable name if program found
-    timetable_name = get_timetable_name(program) if program else None
+    # ── History inheritance ───────────────────────────────────
+    # Look back through last 3 assistant turns for a saved _ctx block.
+    # Inherit only fields the current query left unresolved.
+    prev_ctx = {}
+    if history:
+        checked = 0
+        for turn in reversed(history):
+            if turn.get("role") == "assistant":
+                ctx = turn.get("_ctx") or {}
+                if ctx:
+                    prev_ctx = ctx
+                    break
+                checked += 1
+                if checked >= 3:
+                    break
 
-    # Resolve student groups if program found
+    if prev_ctx:
+        # Program: inherit if not resolved in current query
+        if program is None and prev_ctx.get("program"):
+            program = prev_ctx["program"]
+        # Weekday: only inherit if current query has NO weekday AND
+        # has no reference suggesting a new day
+        if weekday is None and prev_ctx.get("weekday"):
+            weekday = prev_ctx["weekday"]
+        # Subject: inherit if not found in current query
+        if subject is None and prev_ctx.get("subject"):
+            subject = prev_ctx["subject"]
+        # Instructor: inherit if not found
+        if instructor is None and prev_ctx.get("instructor_name"):
+            instructor = prev_ctx["instructor_name"]
+        # Role hint: only inherit if current query is ambiguous
+        if role_hint == "ambiguous" and prev_ctx.get("role_hint") in ("teacher", "student"):
+            role_hint = prev_ctx["role_hint"]
+        # NOTE: date_period is intentionally NOT inherited.
+        # "today" / "this week" are time-sensitive — must be re-stated each turn.
+
+    # Resolve derived fields after inheritance
+    timetable_name = get_timetable_name(program) if program else None
     student_groups = get_student_groups_for_program(program, CUR_YEAR) if program else []
 
     return {
-        "program":         program,
-        "timetable_name":  timetable_name,
-        "student_groups":  student_groups,
-        "weekday":         weekday,
-        "time_val":        time_val,
-        "time_intent":     time_intent,
-        "subject":         subject,
-        "period_no":       period_no,
-        "role_hint":       role_hint,
-        "date_period":     date_period,
-        "instructor_name": instructor,
+        "program":                  program,
+        "timetable_name":           timetable_name,
+        "student_groups":           student_groups,
+        "weekday":                  weekday,
+        "time_val":                 time_val,
+        "time_intent":              time_intent,
+        "subject":                  subject,
+        "period_no":                period_no,
+        "role_hint":                role_hint,
+        "date_period":              date_period,
+        "instructor_name":          instructor,
+        "_inherited_from_history":  bool(prev_ctx),
     }
 
 
@@ -515,6 +562,36 @@ def has_entity_name(q: str) -> bool:
 # Fixed bug: gender_count_by_program now requires has_entity_name=False
 # AND a program to have been resolved — otherwise falls to LLM
 # ═══════════════════════════════════════════════════════════════
+
+# Reference words that signal a follow-up — quick_match must be
+# bypassed so history context can be used to resolve the query.
+REFERENCE_WORDS = {
+    "what about", "how about", "and in", "and for", "same class",
+    "that class", "that standard", "that grade", "same standard",
+    "those students", "them", "their", "those", "same teacher",
+    "that teacher", "the same", "same subject", "also in",
+    "in that", "for that", "of that", "same day", "that day",
+}
+
+def is_followup_query(q: str, history: list) -> bool:
+    """
+    Returns True if the query looks like a follow-up that needs
+    history context to be resolved correctly.
+    Two signals:
+      1. Query contains a reference word (that class, what about, etc.)
+      2. Query is very short (<=4 words) AND history exists —
+         e.g. "what about 6th?" is only 3 words but needs prior context
+    """
+    if not history:
+        return False
+    ql = q.lower()
+    if any(ref in ql for ref in REFERENCE_WORDS):
+        return True
+    # Very short query with history → likely a follow-up
+    if len(q.split()) <= 4 and len(history) >= 2:
+        return True
+    return False
+
 
 CONTACT_WORDS = {"contact", "email", "phone", "mobile", "number", "details", "address"}
 MULTI_INTENT  = {
@@ -708,6 +785,9 @@ def build_prompt(query: str, context: dict, history: list) -> list:
 
     # Format resolved context for injection
     ctx_lines = []
+    if context.get("_inherited_from_history"):
+        ctx_lines.append("  NOTE: Some fields below were inherited from the previous turn.")
+        ctx_lines.append("        If the current query contradicts them, use the current query.")
     if context.get("program"):
         ctx_lines.append(f"  Resolved program:        {context['program']}")
     if context.get("timetable_name"):
@@ -900,7 +980,15 @@ Return ONLY raw JSON. No markdown. No explanation.
 Q: """
 
     messages = [{"role": "system", "content": system}]
+    # Only inject last 3 turns (6 messages: 3 user + 3 assistant).
+    # _ctx keys are internal metadata — strip them before sending to LLM.
+    clean_history = []
     for h in history[-6:]:
+        role    = h.get("role") or ""
+        content = h.get("content") or ""
+        if role and content:
+            clean_history.append({"role": role, "content": content})
+    for h in clean_history:
         messages.append(h)
     messages.append({"role": "user", "content": query})
     return messages
@@ -921,8 +1009,8 @@ async def llm_plan(query: str, history: list) -> dict:
     }
 
     try:
-        # Stage 1: Pre-process — extract structured facts
-        context  = extract_query_context(query)
+        # Stage 1: Pre-process — extract structured facts, inheriting from history
+        context  = extract_query_context(query, history)
 
         # Stage 2: LLM call with resolved context injected
         messages = build_prompt(query, context, history)
@@ -961,7 +1049,8 @@ async def llm_plan(query: str, history: list) -> dict:
             "steps":        parsed.get("steps") or [],
             "post_process": parsed.get("post_process") or [],
             "fallback":     False,
-            "fallback_msg": ""
+            "fallback_msg": "",
+            "_ctx":         context,   # carry resolved context for Frappe to store in history
         }
 
     except Exception as e:
@@ -987,13 +1076,18 @@ async def plan_query(
 
     q = message.lower()
 
-    # Quick match — no LLM, no pre-processing needed
-    qm = quick_match(q)
-    if qm:
-        return PlanResponse(type="quick", pattern=qm)
+    history = req.history or []
 
-    # LLM path — pre-process + plan + validate
-    plan = await llm_plan(message, req.history or [])
+    # If this looks like a follow-up query, skip quick_match entirely
+    # so the LLM can use history context to resolve it correctly.
+    # e.g. "what about 6th?" after a 5th standard query.
+    if not is_followup_query(q, history):
+        qm = quick_match(q)
+        if qm:
+            return PlanResponse(type="quick", pattern=qm)
+
+    # LLM path — pre-process (with history) + plan + validate
+    plan = await llm_plan(message, history)
 
     if plan.get("fallback"):
         return PlanResponse(
@@ -1001,4 +1095,7 @@ async def plan_query(
             message=plan.get("fallback_msg") or "Sorry, I couldn't understand that."
         )
 
-    return PlanResponse(type="orm_plan", plan=plan)
+    # Forward the resolved context so Frappe can store it in history
+    # for follow-up query inheritance
+    ctx = plan.pop("_ctx", None)
+    return PlanResponse(type="orm_plan", plan=plan, ctx=ctx)
